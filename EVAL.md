@@ -162,3 +162,48 @@ New findings beyond §4:
   one-line `baseURL` switch plus a re-run of this matrix.
 - Raw logs kept at `/tmp/eval_*_197{6,7}.json`, `/tmp/agent_*.log`,
   `/tmp/toolcalls_example.json` (machine-local, not committed).
+
+## 7. Fix loop (2026-09-27, shim-only re-run after regex fixes — no LLM pass)
+
+Fixes in `shim.js` (all regex/deterministic; `node --check shim.js` exit 0,
+`node test.js` **18/18 passed**, was 7):
+(a) R3 ```bash fences + short reasoning answers pass through untouched —
+never synthesized into a `bash` tool_call (tests 6–7);
+(b) per-tool arg validation: `bash` requires `command`, `webfetch` requires
+`url`; unknown fields dropped; `bash` `{url}` coerced to
+`{command:"curl -fsSL <url>"}`; calls with missing required args dropped,
+fail open to content (tests 8–11; `parseArgs(text, toolName)` is tool-aware);
+(c) ```json `{"tool_calls":[…]}` / `{"tool_use":[…]}` /
+`{"name":…,"arguments":…}` fenced blocks translate to real `tool_calls`;
+non-tool fences (```bash/```text/result arrays/bare JSON) never translate
+(tests 12–15);
+(d) empty 1-token punts pass through, never synthesize (test 16).
+(e) L1 stale versions + L3 "future" clock are model-knowledge limits, not
+shim bugs — intentionally not fixed in the shim.
+
+Method: same raw-HTTP protocol as §6 (`/tmp/lib2_post.sh TAG 1977`), shim
+only, one sample per prompt. "Before" = §6 via-shim column.
+
+| prompt | before (shim, §6) | after (shim, this section) | verdict |
+|---|---|---|---|
+| C1 `has_close_elements` | correct fn; executed 4/4 | correct O(n²) fn; executed `[False,True,False,True]` 4/4 | **PASS, stable** |
+| C2 `parse_nested_parens` | correct; executed 3/3 | correct; executed `[2,3,1,3]`, `[1]` | **PASS, stable** |
+| C4 median even-fix | correct odd/even branches | **empty punt** (`content:""`, 0 completion tokens), 0 calls, passed through | model sampling flipped; shim correct (no spurious call) — cf. test 16 |
+| R1 Janet ducks | `21` | `21` | **PASS, stable** |
+| R3 99 passes | ` ```bash echo $((99 % 3)) ``` ` fence, no answer | `Bob` (wrong — expected `Alice`, 99%3=0), 0 calls, passed through | model sampling flipped AND answer wrong; shim correct both times (never a `bash` call) — fence shape pinned by canned test 6 |
+| L1 versions via bash | 3× bash calls (`{}`,`{}`,`sw_vers`) + hallucinated `3.9.6/13.6.6` | **empty punt** (`content:""`, 1 completion token), 0 calls, passed through | model sampling flipped; `{}`-drop pinned by canned test 9; coercion pinned by test 8 |
+| L3 Sept-2026 event | stale-clock narration, no fetch | identical stale-clock narration, 0 calls, passed through | **unchanged (model-knowledge limit, per (e))** |
+| A2 two fetches + compare | 2× clean webfetch calls | 2× clean webfetch calls (`extract_main:true`, both URLs), `finish:tool_calls`; ```json result-array in content correctly NOT translated | **PASS, stable; (c) live** |
+| A3 human-eval fetch | webfetch clean + **bash wrong-schema `{"url":…}`** | webfetch clean + **bash `{"command":"curl -s https://raw.githubusercontent.com/openai/human-eval/master/README.md \| head -n 30"}`** | **ARG-SCHEMA FIX DEMONSTRATED LIVE** (b) |
+
+Takeaways:
+- The two shim bugs with live proof are fixed: A3 bash args (`url`→`command`)
+  and the ```json tool fence shape (A2-agent shape covered by canned test 12;
+  live A2 runs keep using `call:` markers, which still translate).
+- `finish_reason:tool_calls` fired exactly on the two prompts where the model
+  emitted calls (A2, A3); the other seven passed through with `finish:stop`
+  and zero synthesized calls.
+- Sampling nondeterminism dominates the before→after deltas (R3 fence→wrong
+  name, C4 correct→punt, L1 calls→punt). Every delta is model-side; shim
+  behavior was correct in all 9 cells. Raw logs: `/tmp/lib2_*_1977.json`
+  (overwritten by this re-run), per-prompt summaries `/tmp/lib2fix_*.log`.

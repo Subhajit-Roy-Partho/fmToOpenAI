@@ -3,7 +3,7 @@
 // + optional live probe of :1976 (never fails the suite when fm is down).
 import assert from "node:assert";
 import http from "node:http";
-import { translateContent, extractCalls, parseArgs, createServer } from "./shim.js";
+import { translateContent, translateFencedContent, translateResponse, extractCalls, extractFencedCalls, parseArgs, coerceToolArgs, createServer } from "./shim.js";
 
 let pass = 0;
 function ok(name, fn) {
@@ -59,7 +59,102 @@ ok("malformed fail-open", () => {
   assert.equal(r.tool_calls, undefined);
 });
 
-// 6. shim server: /health + canned translation through HTTP
+// 6. R3: unexecuted ```bash fence passes through, never becomes a call
+ok("R3 bash fence passthrough", () => {
+  const raw = "```bash\necho $((99 % 3))\n```";
+  const r = translateContent(raw);
+  assert.equal(r.content, raw);
+  assert.equal(r.tool_calls, undefined);
+});
+
+// 7. short reasoning answer passes through untouched
+ok("short reasoning passthrough", () => {
+  for (const raw of ["Alice", "21", "0.05"]) {
+    const r = translateContent(raw);
+    assert.equal(r.content, raw);
+    assert.equal(r.tool_calls, undefined);
+  }
+});
+
+// 8. A3: bash marker with webfetch-shaped {url} coerces to {command}
+ok("bash url->command coercion", () => {
+  const raw = "call:default_api:bash{url:https://raw.githubusercontent.com/openai/human-eval/master/README.md}";
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.equal(r.tool_calls[0].function.name, "bash");
+  const args = JSON.parse(r.tool_calls[0].function.arguments);
+  assert.equal(args.command, "curl -fsSL https://raw.githubusercontent.com/openai/human-eval/master/README.md");
+  assert.ok(!("url" in args), "url dropped from bash args");
+});
+
+// 9. L1: bash marker with {} args fails open (no broken call emitted)
+ok("bash empty-args fail-open", () => {
+  const r = translateContent("call:default_api:bash{}");
+  assert.equal(r.tool_calls, undefined);
+});
+
+// 10. get_time {} still emits (no required fields) — guard vs over-filtering
+ok("get_time empty-args still emits", () => {
+  const r = translateContent("call:default_api:get_time{}");
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+});
+
+// 11. webfetch coercion drops unknown fields incl. command bleed
+ok("webfetch drops unknown fields", () => {
+  const out = coerceToolArgs("webfetch", { url: "https://example.com", command: "echo hi", foo: 1 });
+  assert.deepEqual(out, { url: "https://example.com" });
+});
+
+// 12. A2-agent shape: ```json {"tool_calls":[...]} ``` fence translates
+ok("json tool_calls fence", () => {
+  const raw = "```json\n{\n  \"tool_calls\": [\n    {\"name\": \"webfetch\", \"arguments\": {\"url\": \"https://docs.python.org/3/library/functions.html\", \"format\": \"markdown\", \"extract_main\": true}},\n    {\"name\": \"webfetch\", \"arguments\": {\"url\": \"https://www.w3schools.com/python/python_functions.asp\", \"format\": \"markdown\", \"extract_main\": true}}\n  ]\n}\n```";
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 2, "two tool_calls");
+  assert.equal(JSON.parse(r.tool_calls[0].function.arguments).url, "https://docs.python.org/3/library/functions.html");
+  assert.equal(JSON.parse(r.tool_calls[1].function.arguments).url, "https://www.w3schools.com/python/python_functions.asp");
+  assert.equal(r.content, "", "fence stripped");
+});
+
+// 13. {"tool_use":[...]} fence variant translates
+ok("json tool_use fence", () => {
+  const raw = '```json {"tool_use":[{"name":"webfetch","arguments":{"url":"https://example.com"}}]} ```';
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.equal(r.tool_calls[0].function.name, "webfetch");
+});
+
+// 14. single {"name":...,"arguments":...} fence translates
+ok("json single-name fence", () => {
+  const raw = '```json\n{"name": "bash", "arguments": {"command": "sw_vers"}}\n```';
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.deepEqual(JSON.parse(r.tool_calls[0].function.arguments), { command: "sw_vers" });
+});
+
+// 15. non-tool fences (```text results, bare JSON) never translate
+ok("non-tool fences passthrough", () => {
+  const raw = '```json\n[{"result": "Python docs intro..."}]\n```';
+  const r = translateContent(raw);
+  assert.equal(r.content, raw);
+  assert.equal(r.tool_calls, undefined);
+  const bare = '{"name": "bash", "arguments": {"command": "sw_vers"}}';
+  const r2 = translateContent(bare);
+  assert.equal(r2.content, bare);
+  assert.equal(r2.tool_calls, undefined);
+});
+
+// 16. L1/L3: empty 1-token punts pass through, never synthesize a call
+ok("empty punt passthrough", () => {
+  const r = translateContent("");
+  assert.equal(r.content, "");
+  assert.equal(r.tool_calls, undefined);
+  const obj = { choices: [{ message: { content: "", role: "assistant" }, finish_reason: "stop" }] };
+  assert.equal(translateResponse(obj), false);
+  assert.equal(obj.choices[0].message.content, "");
+  assert.equal(obj.choices[0].finish_reason, "stop");
+});
+
+// 17. shim server: /health + canned translation through HTTP
 const server = createServer();
 await new Promise((res) => server.listen(0, "127.0.0.1", res));
 const port = server.address().port;

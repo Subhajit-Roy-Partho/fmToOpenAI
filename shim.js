@@ -85,11 +85,12 @@ export function extractCalls(content) {
   return { calls, cleaned };
 }
 
-// Parse the brace payload into an args object.
+// Parse the brace payload into an args object (tool-aware when toolName known).
 // 1) try JSON.parse after stripping control chars
-// 2) fallback: extract url/format/timeout keys (webfetch shape)
-// 3) otherwise {}
-export function parseArgs(argsText) {
+// 2) fallback: lenient quote-bare-keys retry
+// 3) tool-targeted extraction: bash -> {command}, else webfetch -> {url,...}
+// 4) otherwise {}
+export function parseArgs(argsText, toolName) {
   const clean = String(argsText).replace(/[\x16\x17]/g, "");
   try {
     const o = JSON.parse(clean);
@@ -107,7 +108,25 @@ export function parseArgs(argsText) {
     const o = JSON.parse(lenient);
     if (o && typeof o === "object") return o;
   } catch {}
-  // webfetch-targeted extraction
+  // tool-targeted extraction (bash -> command, else webfetch shape)
+  if (toolName === "bash") return extractBashArgs(clean);
+  return extractWebfetchArgs(clean);
+}
+
+// bash-targeted extraction: prefer an explicit command key; else wrap a bare
+// URL in a curl fallback command; else {} (coerceToolArgs drops it later).
+export function extractBashArgs(clean) {
+  try {
+    const cmd = String(clean).match(/command\s*[:=]\s*"?([^"\n}]+)"?/i);
+    if (cmd && cmd[1].trim()) return { command: cmd[1].trim() };
+    const url = String(clean).match(/https?:\/\/[^\s"'\\}]+/);
+    if (url) return { command: "curl -fsSL " + url[0] };
+  } catch {}
+  return {};
+}
+
+// webfetch-targeted extraction (url/format/timeout/extract_main keys).
+export function extractWebfetchArgs(clean) {
   const out = {};
   try {
     const url = clean.match(/https?:\/\/[^\s"'\\}]+/);
@@ -122,39 +141,174 @@ export function parseArgs(argsText) {
   return out;
 }
 
+// ---- per-tool arg validation ------------------------------------------------
+// Known schemas; unknown tool names pass through untouched. Returns the
+// coerced args object, or null when required fields are missing (the caller
+// drops the call and fails open to content — never emits a broken call).
+export const TOOL_SCHEMAS = {
+  webfetch: { required: ["url"], optional: ["extract_main", "format", "timeout", "max_chars"] },
+  bash: { required: ["command"], optional: ["timeout", "workdir", "cwd", "env"] },
+  get_time: { required: [], optional: [] },
+};
+
+export function coerceToolArgs(name, args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+  const schema = TOOL_SCHEMAS[name];
+  if (!schema) return args; // unknown tool: pass through
+  const out = {};
+  // bash url->command coercion (the old webfetch-targeted fallback stamped
+  // {url} onto bash calls, e.g. curl-fallback markers — A3 miss).
+  if (name === "bash" && typeof args.command !== "string" && typeof args.url === "string" && args.url) {
+    out.command = "curl -fsSL " + args.url;
+  }
+  for (const k of [...schema.required, ...schema.optional]) {
+    if (k in args && args[k] !== undefined) out[k] = args[k];
+  }
+  for (const k of schema.required) {
+    if (typeof out[k] !== "string" || !out[k].trim()) return null;
+  }
+  return out;
+}
+
+// ---- fenced-JSON tool-call extraction ---------------------------------------
+// Translates ```json {"tool_calls":[{name,arguments}...]} ``` and the
+// {"tool_use":[...]} / {"name":...,"arguments":...} variants into real
+// tool_calls. ONLY json fences with a tool envelope translate — ```bash,
+// ```sh, ```text and other fences always pass through as content (R3: an
+// unexecuted ```bash echo ... ``` fence is narration, never a call).
+// Returns { calls: [{name, args}], cleaned } like extractCalls.
+export function extractFencedCalls(content) {
+  const calls = [];
+  if (typeof content !== "string" || !content.includes("```")) return { calls, cleaned: content };
+  const out = [];
+  let last = 0;
+  const re = /```(?:json)?\s*\n?([\s\S]*?)\n?```/g;
+  let m;
+  let strippedAny = false;
+  while ((m = re.exec(content)) !== null) {
+    const inner = m[1].trim();
+    const entries = parseFenceEnvelope(inner);
+    if (!entries) continue; // not a tool envelope: leave fence in place
+    for (const e of entries) {
+      const norm = normalizeFenceEntry(e);
+      if (norm) calls.push(norm);
+    }
+    if (calls.length > 0 || entries.length > 0) {
+      out.push(content.slice(last, m.index));
+      last = m.index + m[0].length;
+      strippedAny = true;
+    }
+  }
+  if (!strippedAny) return { calls, cleaned: content };
+  out.push(content.slice(last));
+  return { calls, cleaned: out.join("").trim() };
+}
+
+// Parse one fence body; return an entry array, or null when the body is not
+// a tool-call envelope (plain code, prose, tool output — never a call).
+function parseFenceEnvelope(inner) {
+  let o;
+  try { o = JSON.parse(inner); } catch { return null; }
+  if (o && typeof o === "object" && !Array.isArray(o)) {
+    if (Array.isArray(o.tool_calls)) return o.tool_calls;
+    if (Array.isArray(o.tool_use)) return o.tool_use;
+    if (typeof o.name === "string" && ("arguments" in o || "input" in o)) return [o];
+    if (o.function && typeof o.function.name === "string") return [o];
+    return null;
+  }
+  if (Array.isArray(o) && o.every((e) => e && typeof e.name === "string")) return o;
+  return null;
+}
+
+// Normalise one fence entry -> {name, args} or null (skipped).
+function normalizeFenceEntry(e) {
+  try {
+    if (!e || typeof e !== "object") return null;
+    if (e.function && typeof e.function.name === "string") {
+      return { name: e.function.name, args: coerceFenceArgs(e.function.arguments), id: e.id };
+    }
+    if (typeof e.name === "string") {
+      const raw = ("arguments" in e) ? e.arguments : e.input;
+      return { name: e.name, args: coerceFenceArgs(raw) };
+    }
+  } catch {}
+  return null;
+}
+
+function coerceFenceArgs(raw) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try { const o = JSON.parse(raw); if (o && typeof o === "object") return o; } catch {}
+    return {};
+  }
+  return {};
+}
+
 let callSeq = 0;
-export function toToolCall(name, argsObj) {
+export function toToolCall(name, argsObj, opts) {
   callSeq += 1;
-  const id = "call_" + randomUUID().replace(/-/g, "").slice(0, 12) + "_" + String(callSeq);
+  const id = (opts && typeof opts.id === "string" && opts.id) ||
+    "call_" + randomUUID().replace(/-/g, "").slice(0, 12) + "_" + String(callSeq);
   return { id, type: "function", function: { name, arguments: JSON.stringify(argsObj ?? {}) } };
 }
 
-// Translate assistant message content -> { content, tool_calls, finish_reason }
-// Never throws: fails open to { content: original }.
 export function translateContent(content) {
+// Paths: (1) call:default_api markers; (2) ```json tool_calls/tool_use/name
+// fences. Everything else — ```bash fences, narration, empty punts — passes
+// through untouched (never synthesize a call).
+// Never throws: fails open to { content: original }.
   try {
-    if (typeof content !== "string" || !content.includes("call:")) {
-      if (STRIP_ONLY && typeof content === "string" && /[\x16\x17]|<ctrl4[56]>|\[CTRL/i.test(content)) {
+    if (typeof content !== "string" || content === "") return { content };
+    const HAS_MARKER_RE = new RegExp("[\\x16\\x17]|<ctrl4[56]>|\\[CTRL", "i");
+    if (!content.includes("call:")) {
+      if (STRIP_ONLY && HAS_MARKER_RE.test(content)) {
         return { content: stripMarkers(content), tool_calls: undefined };
       }
-      return { content };
+      return translateFencedContent(content);
     }
     if (STRIP_ONLY) return { content: stripMarkers(content), tool_calls: undefined };
     const { calls, cleaned } = extractCalls(content);
     if (calls.length === 0) {
-      // no balanced match: optionally strip stray markers, else passthrough
-      if (/[\x16\x17]|<ctrl4[56]>|\[CTRL/i.test(content)) {
+      // no balanced match: optionally strip stray markers, else try fences
+      if (HAS_MARKER_RE.test(content)) {
         const stripped = stripMarkers(content);
         if (stripped !== content) return { content: stripped };
       }
-      return { content };
+      return translateFencedContent(content);
     }
-    const tool_calls = calls.map((c) => toToolCall(c.name, parseArgs(c.argsText)));
+    // Per-tool validation: coerce/drop unknown fields; drop calls whose
+    // required args are missing (fail open) instead of emitting broken calls.
+    const tool_calls = [];
+    for (const c of calls) {
+      const coerced = coerceToolArgs(c.name, parseArgs(c.argsText, c.name));
+      if (coerced === null) continue;
+      tool_calls.push(toToolCall(c.name, coerced));
+    }
+    if (tool_calls.length === 0) return { content };
     return { content: cleaned || "", tool_calls, finish_reason: "tool_calls" };
   } catch {
     return { content };
   }
 }
+
+// Fence path: translate ```json tool envelopes; pass everything else through.
+export function translateFencedContent(content) {
+  try {
+    const { calls, cleaned } = extractFencedCalls(content);
+    if (calls.length === 0) return { content };
+    const tool_calls = [];
+    for (const c of calls) {
+      const coerced = coerceToolArgs(c.name, c.args);
+      if (coerced === null) continue;
+      tool_calls.push(toToolCall(c.name, coerced, { id: c.id }));
+    }
+    if (tool_calls.length === 0) return { content };
+    return { content: cleaned || "", tool_calls, finish_reason: "tool_calls" };
+  } catch {
+    return { content };
+  }
+}
+
 
 // Apply translation to a non-streaming chat.completion response object.
 export function translateResponse(obj) {

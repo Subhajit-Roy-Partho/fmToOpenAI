@@ -23,6 +23,8 @@
 
 import http from "node:http";
 import { randomUUID } from "node:crypto";
+import cluster from "node:cluster";
+import os from "node:os";
 
 export const UPSTREAM_RAW = process.env.AFM_UPSTREAM || "http://127.0.0.1:1976/v1";
 // Normalise: upstream may be given with or without the /v1 suffix; request
@@ -31,6 +33,29 @@ export const UPSTREAM_BASE = UPSTREAM_RAW.replace(/\/v1\/?$/, "").replace(/\/$/,
 export const UPSTREAM = UPSTREAM_BASE + "/v1";
 export const LISTEN_PORT = Number(process.env.AFM_SHIM_PORT || process.env.PORT || 1977);
 const STRIP_ONLY = process.env.FM_STRIP_MARKERS === "1";
+
+// ---- multicore (Phase 1): Node cluster, stdlib only --------------------------
+// Flag-gated: FM_WORKERS=N (default 1 = single-process, current behaviour).
+// N=0 means auto: min(os.cpus().length, 4). N>1 forks N workers sharing
+// :LISTEN_PORT via the cluster scheduler. N<=0 (other than the 0=auto
+// special case), NaN, and unset all fall back to 1.
+// Concurrency safety: per-request state stays in-request — the buffered SSE
+// accumulation (buf/template/accum/order in sseTranslateAndRelay) is all
+// allocated inside the per-request closure, and the only module-level mutable
+// state is `callSeq` (a per-process id counter; each worker has isolated
+// memory, and ids also embed a randomUUID prefix, so no cross-worker
+// collision). Everything else module-level is a constant.
+export function resolveWorkerCount(envVal, cpuCount) {
+  if (envVal === undefined || envVal === null || String(envVal).trim() === "") return 1;
+  const n = Number.parseInt(String(envVal).trim(), 10);
+  if (!Number.isFinite(n) || n < 0) return 1;
+  if (n === 0) return Math.max(1, Math.min(cpuCount || 1, 4));
+  return n;
+}
+export const WORKER_COUNT = resolveWorkerCount(
+  process.env.FM_WORKERS,
+  (os.cpus() || []).length || 1
+);
 
 // ---- marker normalisation -------------------------------------------------
 // Replace every marker flavour with \x16 (open) / \x17 (close) so one regex
@@ -605,8 +630,17 @@ export function createServer() {
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());
 if (isMain) {
-  const server = createServer();
-  server.listen(LISTEN_PORT, "127.0.0.1", () => {
-    console.log(`[afm-openai-shim] listening :${LISTEN_PORT} -> ${UPSTREAM}`);
-  });
+  if (cluster.isPrimary && WORKER_COUNT > 1) {
+    console.log(`[afm-openai-shim] primary ${process.pid} starting ${WORKER_COUNT} workers -> :${LISTEN_PORT} (upstream ${UPSTREAM})`);
+    for (let i = 0; i < WORKER_COUNT; i++) cluster.fork();
+    cluster.on("exit", (worker, code, signal) => {
+      console.error(`[shim] worker ${worker.process.pid} died (code=${code} signal=${signal || "-"}) — respawning`);
+      cluster.fork();
+    });
+  } else {
+    const server = createServer();
+    server.listen(LISTEN_PORT, "127.0.0.1", () => {
+      console.log(`[afm-openai-shim] listening :${LISTEN_PORT} -> ${UPSTREAM} (pid ${process.pid}${cluster.isWorker ? ", worker" : ""})`);
+    });
+  }
 }

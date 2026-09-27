@@ -52,6 +52,9 @@ case "$CMD" in
       echo "$PID" >"$PIDFILE"
       echo "shim started :$PORT (pid $PID, log $LOG)"
       NLISTEN="$(lsof -ti :"$PORT" 2>/dev/null | wc -l | tr -d ' ')"
+      # Cluster mode (FM_WORKERS>1): the primary still holds the single shared
+      # :PORT socket (workers take connections via IPC), so exactly 1 listener
+      # is expected in both modes — worker count is visible via `status`.
       if [ "$NLISTEN" != "1" ]; then echo "WARN: $NLISTEN listeners on :$PORT (expected 1): $(lsof -ti :$PORT 2>/dev/null | tr '\n' ' ')"; exit 1
       else echo "single listener verified :$PORT (pid $PID)"; fi
     else
@@ -66,7 +69,13 @@ case "$CMD" in
     ;;
   restart) "$0" stop "$PORT"; "$0" start "$PORT" ;;
   status)
-    if is_up; then echo "shim :$PORT up (pid $(cat "$PIDFILE"))"; curl -s -m 3 "http://127.0.0.1:$PORT/health"; echo
+    if is_up; then
+      PID="$(cat "$PIDFILE")"
+      KIDS="$(pgrep -P "$PID" 2>/dev/null | wc -l | tr -d ' ')"
+      [ -z "$KIDS" ] && KIDS=0
+      NLISTEN="$(lsof -ti :"$PORT" 2>/dev/null | wc -l | tr -d ' ')"
+      echo "shim :$PORT up (pid $PID, workers $KIDS, listeners ${NLISTEN:-0})"
+      curl -s -m 3 "http://127.0.0.1:$PORT/health"; echo
     else echo "shim :$PORT down"; exit 1; fi
     ;;
   *) echo "usage: $0 {start|stop|restart|status} [port]"; exit 2 ;;

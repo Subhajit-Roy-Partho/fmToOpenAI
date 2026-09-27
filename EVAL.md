@@ -250,3 +250,56 @@ suite pins all observed shapes (markers, 3 json-fence envelopes, bash-fence
 and punt passthrough, per-tool arg validation), and the remaining gap is
 the agent streaming path (split-across-chunks calls), which needs either
 client-side buffering or a streaming assembler — not a regex tweak.
+
+## 9. SSE split-chunk fix + verification (2026-09-27, shim streaming path)
+
+Miss #4 closed in `shim.js`: `sseTranslateAndRelay` no longer translates
+each SSE delta in isolation (a `<ctrl46>call:…` marker split mid-name or
+mid-JSON across chunks could never match). It now **buffers the full
+`delta.content` per choice index**, forwards only non-content frames
+(role-only/finish/keep-alive) immediately, and runs the existing
+`translateContent()` **once over the assembled content at `[DONE]`**
+(or stream `end` when `[DONE]` is missing). The result is re-emitted as
+final SSE chunk(s) before `[DONE]` — framing stays valid SSE throughout:
+tool path emits one chunk with `delta:{content,tool_calls}` +
+`finish_reason:tool_calls`; strip-only or no-op paths re-emit the
+assembled content verbatim as one chunk; empty punts emit nothing extra.
+The SSE log line keeps the non-streaming prefix
+`[shim] translated N tool_call(s): <names>` (suffix ` (sse, buffered)`)
+so one grep covers both paths. `sseTranslateAndRelay` is now exported
+for tests. `node --check shim.js` exit 0, `node test.js` **20/20**
+(new test 19: canned split-chunk SSE stream — marker split mid-literal
+`<ct|rl46>`, mid-name `webf|etch`, mid-JSON URL `example.|com`, raw byte
+stream re-sliced into 37-char TCP fragments so SSE framing itself splits;
+asserts naive per-fragment translation misses every piece while the
+buffered relay emits exactly one `tool_calls` chunk
+(`webfetch {"url":"https://example.com"}`, `finish:tool_calls`),
+no `call:` leak in any re-emitted chunk, stream ends `data: [DONE]`).
+Shim restarted via `./shim.sh restart` (pid 56007, `/health` ok;
+pidfile pid == `lsof -ti :1977` listener).
+
+lib-2 re-run via `:1977` (non-stream, deltas vs §7 only):
+C1/C2 correct fns, stop, no tools — **PASS, stable**; C4 correct
+odd/even branches (`2.5`/`2`) — model flipped punt→correct, shim
+passthrough correct; R1 `21` — **PASS, stable**; R3 back to
+` ```bash echo $((99 % 3)) ``` ` fence, no answer — model flip,
+shim correctly passes through (canned test 6).
+L1/L3/A2/A3: **no data — upstream `fm serve` returned HTTP 429
+`insufficient_quota` ("Your quota has been reached")** on every attempt
+(3 rounds over ~20 min, incl. a direct-`:1976` A3 probe proving the
+limit is upstream, not the shim; even R1 429s by the end). Raw logs
+`/tmp/lib2_*_1977.json` overwritten; 429 bodies (117 bytes) in place
+of completions.
+
+End-to-end (streaming agent path): `timeout 170 opencode run --model
+apple-fm/pcc --agent afm-agent "Fetch https://example.com and quote
+its title. Use webfetch."` from `/tmp/afm-agent-check2` →
+**FAIL (exit 1, `Error: Your quota has been reached. Please try again
+later.`, log `/tmp/e2e_sse_053609.log`)**. No new `[shim] translated`
+line appeared during the run (the single such line in `shim.1977.log`
+predates this session's restart) — expected, since upstream 429'd
+before streaming any content for the buffered translator to act on.
+So: **split-chunk translation is proven by the canned 20/20 regression,
+but live end-to-end afm-agent tool execution is still unproven** —
+blocker this round is upstream quota, not shim logic. Re-run this
+section's lib-2 + e2e cells once `:1976` quota recovers.

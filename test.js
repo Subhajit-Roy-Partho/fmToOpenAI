@@ -3,7 +3,8 @@
 // + optional live probe of :1976 (never fails the suite when fm is down).
 import assert from "node:assert";
 import http from "node:http";
-import { translateContent, translateFencedContent, translateResponse, extractCalls, extractFencedCalls, parseArgs, coerceToolArgs, createServer } from "./shim.js";
+import { translateContent, translateFencedContent, translateResponse, extractCalls, extractFencedCalls, parseArgs, coerceToolArgs, createServer, sseTranslateAndRelay } from "./shim.js";
+import { EventEmitter } from "node:events";
 
 let pass = 0;
 function ok(name, fn) {
@@ -162,6 +163,59 @@ ok("empty punt passthrough", () => {
   assert.equal(obj.choices[0].message.content, "");
   assert.equal(obj.choices[0].finish_reason, "stop");
 });
+
+// 19. SSE split-chunk (§4 miss #4): marker split mid-name + mid-JSON across
+// TCP fragments still translates via buffered re-emit at [DONE].
+await (async () => {
+  const name = "sse split-chunk buffered translation";
+  try {
+    const full = "<ctrl46>call:default_api:webfetch{extract_main:true,format:<ctrl46>text<ctrl46>,timeout:30,url:<ctrl46>https://example.com<ctrl46>}<ctrl46>";
+    // Split mid-literal (<ct|rl46>), mid-name (webf|etch), mid-JSON URL (example.|com).
+    const pieces = [
+      full.slice(0, 3),    // "<ct"
+      full.slice(3, 28),   // "rl46>call:default_ap"
+      full.slice(28, 120), // "i:webfetch{...url:<ctrl46>https://example."
+      full.slice(120),     // "com<ctrl46>}<ctrl46>"
+    ];
+    assert.equal(pieces.join(""), full, "pieces reassemble");
+    // Naive per-chunk translation misses every fragment (the old bug).
+    for (const p of pieces) {
+      assert.equal(translateContent(p).tool_calls, undefined, "per-chunk misses: " + JSON.stringify(p.slice(0, 24)));
+    }
+    // Wrap fragments as SSE deltas, then re-slice the raw byte stream into
+    // odd-sized TCP fragments (also splits SSE framing itself).
+    const sseBody = pieces.map((c) => "data: " + JSON.stringify({ id: "x", object: "chat.completion.chunk", created: 1, model: "pcc", choices: [{ index: 0, delta: { role: "assistant", content: c }, finish_reason: null }] }) + "\n\n").join("") + "data: [DONE]\n\n";
+    const frags = [];
+    for (let i = 0; i < sseBody.length; i += 37) frags.push(sseBody.slice(i, i + 37));
+    const up = new EventEmitter();
+    up.statusCode = 200;
+    const writes = [];
+    let ended = false;
+    const client = { writeHead() {}, write(c) { writes.push(String(c)); }, end() { ended = true; } };
+    sseTranslateAndRelay(up, client);
+    for (const f of frags) up.emit("data", Buffer.from(f, "utf8"));
+    up.emit("end");
+    assert.ok(ended, "client ended");
+    const raw = writes.join("");
+    assert.ok(raw.endsWith("data: [DONE]\n\n"), "framing ends with [DONE]");
+    const payloads = raw.split("\n\n").filter((e) => e.startsWith("data:")).map((e) => e.slice(5).trim());
+    assert.ok(payloads[payloads.length - 1] === "[DONE]", "last payload is [DONE]");
+    const objs = payloads.slice(0, -1).map((p) => JSON.parse(p));
+    const withCalls = objs.filter((o) => (o.choices || []).some((c) => c.delta && c.delta.tool_calls));
+    assert.equal(withCalls.length, 1, "exactly one translated chunk");
+    const tc = withCalls[0].choices[0].delta.tool_calls[0];
+    assert.equal(tc.function.name, "webfetch");
+    assert.equal(JSON.parse(tc.function.arguments).url, "https://example.com");
+    assert.equal(withCalls[0].choices[0].finish_reason, "tool_calls");
+    for (const o of objs) {
+      for (const c of o.choices || []) {
+        assert.ok(!String(c.delta?.content || "").includes("call:"), "no marker leak in re-emit");
+      }
+    }
+    pass++;
+    console.log("PASS " + name);
+  } catch (e) { console.error("FAIL " + name + ": " + (e?.message || e)); process.exitCode = 1; }
+})();
 
 // 17. shim server: /health + canned translation through HTTP
 const server = createServer();

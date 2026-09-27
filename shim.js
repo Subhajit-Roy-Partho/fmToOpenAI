@@ -384,52 +384,120 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function sseTranslateAndRelay(upstreamRes, clientRes) {
+export function sseTranslateAndRelay(upstreamRes, clientRes) {
+  // Buffered SSE translation (fixes §4 miss #4: split-chunk markers).
+  // Upstream FM SSE deltas arrive in arbitrary TCP/SSE fragments, so a
+  // `<ctrl46>call:…` marker is routinely split mid-name or mid-JSON across
+  // chunks and per-chunk translateContent() can never fire. Instead we
+  // accumulate the full delta.content per choice index, forward only
+  // non-content frames immediately (role, keep-alives), and run the existing
+  // translateContent() ONCE over the assembled content at [DONE]/end. The
+  // translated result is re-emitted as final SSE chunk(s) before [DONE], so
+  // SSE event framing to the client is always valid.
   clientRes.writeHead(upstreamRes.statusCode || 200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
   });
   let buf = "";
+  let template = null; // {id, object, created, model} from first chunk
+  const accum = new Map(); // index -> { content, role, finish }
+  const order = []; // choice indices in first-seen order
+  const ensure = (idx) => {
+    if (!accum.has(idx)) { accum.set(idx, { content: "", role: "assistant", finish: null }); order.push(idx); }
+    return accum.get(idx);
+  };
+  const noteTemplate = (obj) => {
+    if (!template && obj && typeof obj === "object") {
+      template = {
+        id: obj.id || ("chatcmpl-" + randomUUID().replace(/-/g, "").slice(0, 8)),
+        object: "chat.completion.chunk",
+        created: obj.created || Math.floor(Date.now() / 1000),
+        model: obj.model || "pcc",
+      };
+    }
+  };
+  const flushTranslated = () => {
+    const tpl = template || {
+      id: "chatcmpl-" + randomUUID().replace(/-/g, "").slice(0, 8),
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: "pcc",
+    };
+    if (order.length === 0) return; // nothing buffered (empty punt etc.)
+    for (const idx of order) {
+      const a = accum.get(idx);
+      const full = a.content;
+      if (!full) {
+        if (a.finish) {
+          clientRes.write("data: " + JSON.stringify({ ...tpl, choices: [{ index: idx, delta: {}, finish_reason: a.finish }] }) + "\n\n");
+        }
+        continue;
+      }
+      let r;
+      try { r = translateContent(full); } catch { r = { content: full }; }
+      if (r && r.tool_calls) {
+        clientRes.write("data: " + JSON.stringify({
+          ...tpl,
+          choices: [{ index: idx, delta: { role: a.role || "assistant", content: r.content || "", tool_calls: r.tool_calls }, finish_reason: r.finish_reason || "tool_calls" }],
+        }) + "\n\n");
+        // Log line matches the non-streaming path's `[shim] translated N
+        // tool_call(s):` prefix so one grep covers both (suffix notes SSE).
+        console.error("[shim] translated " + r.tool_calls.length + " tool_call(s): " + r.tool_calls.map((t) => (t && t.function && t.function.name) || "?").join(",") + " (sse, buffered)");
+      } else if (typeof r.content === "string" && r.content !== full) {
+        clientRes.write("data: " + JSON.stringify({
+          ...tpl, choices: [{ index: idx, delta: { role: a.role || "assistant", content: r.content }, finish_reason: a.finish || null }],
+        }) + "\n\n");
+      } else {
+        // No translation: re-emit the assembled content verbatim as one chunk.
+        clientRes.write("data: " + JSON.stringify({
+          ...tpl, choices: [{ index: idx, delta: { role: a.role || "assistant", content: full }, finish_reason: a.finish || null }],
+        }) + "\n\n");
+      }
+    }
+  };
+  let doneSeen = false;
+  const handleEvent = (event) => {
+    const lines = event.split("\n");
+    const dataLines = lines.filter((l) => l.startsWith("data:"));
+    if (dataLines.length === 0) { clientRes.write(event + "\n\n"); return; } // comment/keep-alive
+    const payload = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
+    if (payload === "[DONE]") { doneSeen = true; flushTranslated(); clientRes.write("data: [DONE]\n\n"); return; }
+    let obj;
+    try { obj = JSON.parse(payload); } catch { clientRes.write(event + "\n\n"); return; } // fail open
+    try {
+      noteTemplate(obj);
+      let hasContent = false;
+      for (const ch of obj?.choices || []) {
+        const idx = (ch && typeof ch.index === "number") ? ch.index : 0;
+        const a = ensure(idx);
+        const delta = ch?.delta;
+        if (delta) {
+          if (typeof delta.role === "string" && delta.role) a.role = delta.role;
+          if (typeof delta.content === "string") { a.content += delta.content; hasContent = true; }
+        }
+        if (ch && ch.finish_reason !== undefined && ch.finish_reason !== null) a.finish = ch.finish_reason;
+      }
+      if (!hasContent) clientRes.write("data: " + JSON.stringify(obj) + "\n\n"); // role/finish-only frames pass through
+      // content-bearing frames are held for the buffered re-emit at [DONE]
+    } catch { clientRes.write(event + "\n\n"); }
+  };
   upstreamRes.on("data", (chunk) => {
     buf += chunk.toString("utf8");
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const event = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
-      const lines = event.split("\n");
-      const dataLines = lines.filter((l) => l.startsWith("data:"));
-      if (dataLines.length === 0) { clientRes.write(event + "\n\n"); continue; }
-      const payload = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
-      if (payload === "[DONE]") { clientRes.write("data: [DONE]\n\n"); continue; }
-      try {
-        const obj = JSON.parse(payload);
-        let touched = false;
-        for (const ch of obj?.choices || []) {
-          const delta = ch?.delta;
-          if (delta && typeof delta.content === "string" && delta.content.includes("call:")) {
-            const r = translateContent(delta.content);
-            if (r.tool_calls) {
-              delta.content = r.content || "";
-              delta.tool_calls = r.tool_calls;
-              if (r.finish_reason) ch.finish_reason = r.finish_reason;
-              touched = true;
-              console.error("[shim] translated (sse) " + r.tool_calls.length + " tool_call(s): " + r.tool_calls.map((t) => (t && t.function && t.function.name) || "?").join(","));
-            } else if (r.content !== delta.content) {
-              delta.content = r.content;
-              touched = true;
-            }
-          }
-        }
-        clientRes.write("data: " + JSON.stringify(obj) + "\n\n");
-        void touched;
-      } catch {
-        clientRes.write(event + "\n\n"); // fail open
-      }
+      handleEvent(event);
     }
   });
   upstreamRes.on("end", () => {
-    if (buf.trim()) clientRes.write(buf);
+    try {
+      // Leftover partial frame (no trailing \n\n): parse if it holds data.
+      if (buf.trim()) handleEvent(buf);
+      if (!doneSeen) { flushTranslated(); clientRes.write("data: [DONE]\n\n"); }
+    } catch {}
+    buf = "";
     clientRes.end();
   });
   upstreamRes.on("error", () => { try { clientRes.end(); } catch {} });

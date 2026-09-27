@@ -1,4 +1,4 @@
-# afm-openai-shim
+# fmToOpenAI
 
 OpenAI-compatible `tool_calls` shim for **Apple Foundation Models** (`fm serve`).
 

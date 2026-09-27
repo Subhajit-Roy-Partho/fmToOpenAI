@@ -1,5 +1,5 @@
 {
-  "name": "afm-openai-shim",
+  "name": "fmToOpenAI",
   "version": "0.1.0",
   "description": "OpenAI-compatible tool_call shim for Apple Foundation Models (fm serve)",
   "type": "module",

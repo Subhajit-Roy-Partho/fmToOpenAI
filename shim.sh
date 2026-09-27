@@ -17,10 +17,18 @@ case "$CMD" in
   start)
     if is_up; then echo "shim :$PORT already running (pid $(cat "$PIDFILE"))"; exit 0; fi
     rm -f "$PIDFILE"
-    (cd "$DIR" && AFM_SHIM_PORT="$PORT" nohup node shim.js >>"$LOG" 2>&1 & echo $! >"$PIDFILE")
+    (cd "$DIR" && AFM_SHIM_PORT="$PORT" nohup node shim.js >>"$LOG" 2>&1 &)
+    # pidfile = actual TCP listener (nohup/subshell pids are unreliable)
+    PID=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      PID="$(lsof -ti :"$PORT" 2>/dev/null | head -1)"
+      [ -n "$PID" ] && break
+      sleep 0.5
+    done
     sleep 1
-    if is_up && curl -s -m 3 "http://127.0.0.1:$PORT/health" >/dev/null; then
-      echo "shim started :$PORT (pid $(cat "$PIDFILE"), log $LOG)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && curl -s -m 3 "http://127.0.0.1:$PORT/health" >/dev/null; then
+      echo "$PID" >"$PIDFILE"
+      echo "shim started :$PORT (pid $PID, log $LOG)"
     else
       echo "shim :$PORT failed to start — see $LOG"; rm -f "$PIDFILE"; exit 1
     fi

@@ -212,7 +212,12 @@ function parseFenceEnvelope(inner) {
   if (o && typeof o === "object" && !Array.isArray(o)) {
     if (Array.isArray(o.tool_calls)) return o.tool_calls;
     if (Array.isArray(o.tool_use)) return o.tool_use;
-    if (typeof o.name === "string" && ("arguments" in o || "input" in o)) return [o];
+    // single-call envelope: {"name":...} or {"tool_name":...} + arguments/input
+    const nm = typeof o.name === "string" ? o.name
+      : (typeof o.tool_name === "string" ? o.tool_name : null);
+    if (nm && ("arguments" in o || "input" in o)) {
+      return [{ name: nm, arguments: ("arguments" in o) ? o.arguments : o.input }];
+    }
     if (o.function && typeof o.function.name === "string") return [o];
     return null;
   }
@@ -409,6 +414,7 @@ function sseTranslateAndRelay(upstreamRes, clientRes) {
               delta.tool_calls = r.tool_calls;
               if (r.finish_reason) ch.finish_reason = r.finish_reason;
               touched = true;
+              console.error("[shim] translated (sse) " + r.tool_calls.length + " tool_call(s): " + r.tool_calls.map((t) => (t && t.function && t.function.name) || "?").join(","));
             } else if (r.content !== delta.content) {
               delta.content = r.content;
               touched = true;
@@ -473,6 +479,10 @@ export function createServer() {
               try {
                 const obj = JSON.parse(data);
                 translateResponse(obj);
+                if (obj?.choices?.[0]?.message?.tool_calls) {
+                  const tcs = obj.choices[0].message.tool_calls;
+                  console.error("[shim] translated " + tcs.length + " tool_call(s): " + tcs.map((t) => (t && t.function && t.function.name) || "?").join(","));
+                }
                 res.setHeader("x-afm-shim", "1");
                 return sendJson(res, up.statusCode || 200, obj);
               } catch {

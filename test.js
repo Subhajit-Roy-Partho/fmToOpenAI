@@ -131,6 +131,15 @@ ok("json single-name fence", () => {
   assert.deepEqual(JSON.parse(r.tool_calls[0].function.arguments), { command: "sw_vers" });
 });
 
+// 18. {"tool_name":...} single-call fence variant translates
+ok("json tool_name fence", () => {
+  const raw = '```json\n{\n  "tool_name": "webfetch",\n  "arguments": { "url": "https://example.com", "extract_main": true, "format": "text", "timeout": 30 }\n}\n```';
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.equal(r.tool_calls[0].function.name, "webfetch");
+  assert.equal(JSON.parse(r.tool_calls[0].function.arguments).url, "https://example.com");
+});
+
 // 15. non-tool fences (```text results, bare JSON) never translate
 ok("non-tool fences passthrough", () => {
   const raw = '```json\n[{"result": "Python docs intro..."}]\n```';

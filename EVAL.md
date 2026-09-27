@@ -207,3 +207,46 @@ Takeaways:
   name, C4 correct→punt, L1 calls→punt). Every delta is model-side; shim
   behavior was correct in all 9 cells. Raw logs: `/tmp/lib2_*_1977.json`
   (overwritten by this re-run), per-prompt summaries `/tmp/lib2fix_*.log`.
+
+## 8. Config rewire + verification (2026-09-27, translator route live)
+
+Port: **1977 kept** (`lsof -i :1977` empty before start; `fm serve` owns
+:1976). `shim.sh` lifecycle (`start|stop|restart|status`, pidfile
+`/tmp/afm-openai-shim.1977.pid`, log `shim.1977.log` in repo dir, gitignored):
+`./shim.sh start` → pid 55828, `/health` → `{"status":"ok",
+"upstream":"http://127.0.0.1:1976/v1"}`. One fix during this section:
+pidfile first captured the subshell pid — now records the `lsof -ti :PORT`
+listener; verified `stop`→port free→`start`→same pid listens.
+Config (`~/.config/opencode/opencode.jsonc`, ONLY this hunk changed):
+`provider.apple-fm.options.baseURL` `http://127.0.0.1:1976/v1` →
+`http://127.0.0.1:1977/v1`, with a comment noting the direct `:1976`
+fallback (raw markers leak). No other lines touched.
+
+Verification (from `/tmp/afm-agent-check2`):
+1. `opencode run --model apple-fm/pcc --agent afm-agent "What is 2+2?
+   Answer with just the number."` → **`4`**, no tool. Wiring proof:
+   with the shim stopped the same command loops `> afm-agent · pcc`
+   retries until timeout (exit 124) — agent traffic routes via `:1977`.
+2. Webfetch agent prompt ("Fetch https://example.com with webfetch now…"):
+   attempt 1 printed an unexecuted ` ```json {"tool_name":"webfetch",…} ```
+   block and stopped — a THIRD fence-envelope shape (singular `tool_name`,
+   §7 covered `tool_calls`/`tool_use`/`name`). Parser extended the same
+   day (`parseFenceEnvelope` accepts `tool_name`, canned test 18,
+   suite now **19/19**). Attempts 2–3 emitted `call:default_api:webfetch`
+   markers split across SSE chunks (per-chunk translation can't fire —
+   known §4 miss #4, still open) plus a fabricated ```text result from
+   knowledge: **no end-to-end tool execution in any agent run yet**.
+3. Shim-log evidence (non-streaming raw HTTP via `:1977`, same prompt):
+   `finish_reason:tool_calls`, 1 call
+   `webfetch {"url":"https://example.com"}`, and the log line
+   `[shim] translated 1 tool_call(s): webfetch`. Both the non-streaming
+   and SSE translate paths now log one line per translation (logging-only
+   addition; `node --check` + 19/19 green before and after).
+   (One transient upstream HTTP 500 observed on an earlier attempt;
+   retry succeeded — FM-side flake, shim passed it through.)
+
+Bottom line: the translator route is live for `afm-agent`, the deterministic
+suite pins all observed shapes (markers, 3 json-fence envelopes, bash-fence
+and punt passthrough, per-tool arg validation), and the remaining gap is
+the agent streaming path (split-across-chunks calls), which needs either
+client-side buffering or a streaming assembler — not a regex tweak.

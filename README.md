@@ -55,6 +55,28 @@ Go-live default is **3 workers**, persisted in `shim.sh`
 `FM_WORKERS=1 ./shim.sh restart`. `./shim.sh status` reports the count
 (`workers N`, single `listeners 1` in both modes).
 
+## Lifecycle (`shim.sh` manages `fm serve` too)
+
+`./shim.sh {start|stop|restart|status} [port]` (default `:1977`) manages the
+shim **and** the `fm serve` upstream (`:1976`):
+
+- `start` first probes `:1976` (`GET /v1/models`). If down, it launches
+  `fm serve` in the background (`nohup`, log `fm-serve.log` in the repo dir),
+  waits up to ~60s for `:1976` to become healthy (fails with a clear message
+  otherwise — no orphaned shim without a backend), and records ownership in
+  `/tmp/afm-openai-shim.fm-managed`. If `:1976` is already healthy (you run
+  your own `fm serve`), the shim attaches to it and records nothing.
+- `stop` stops the shim and — only if the managed-flag exists — stops the
+  shim-started `fm serve` (stored pid, verified by command line / held
+  listener before signalling, so pid reuse can't kill a stranger). A
+  user-owned `fm serve` is never touched.
+- `status` reports both sides: shim (`up` + workers/listeners, or `down`)
+  and upstream (`up (managed, pid …)` / `up (user-owned)` / `down`).
+
+Test overrides (exercise the managed lifecycle without touching live `:1976`):
+`AFM_UPSTREAM_PORT` / `AFM_UPSTREAM`, e.g. `AFM_UPSTREAM_PORT=19760
+./shim.sh start 19779` with a stub `fm` earlier in `PATH`.
+
 ## opencode.jsonc snippet
 
 Point the provider at the shim instead of `fm serve` directly:

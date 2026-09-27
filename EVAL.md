@@ -108,6 +108,44 @@ Misses (observed live, all fail open — never translated, never error):
    clarifying questions) that emit no markers at all — nothing to translate.
 4. Split-across-chunks calls in SSE streams (per README; not exercised here).
 5. Residue edge: malformed double-wrapped markers leave a stray `}` in `content`.
+6. (lib-2 appendix, §6) ` ```json {"tool_calls":[…]} ``` ` fence shape —
+   right calls, wrong envelope (A2 agent run); bash calls extracted with the
+   webfetch arg schema (`{"url":…}` instead of `{"command":…}`, A3 shim).
+7. (lib-2 appendix, §6) Empty 1-token punts: `content:""`, `finish:stop`
+   (L1/L3 direct) — model declines without emitting anything.
+
+## 6. lib-2 canonical prompts appendix (2026-09-27, same method)
+
+Ground truth (this machine): Python **3.11.16**, macOS **27.2**. Same raw-HTTP
+`tools:[webfetch,bash]` direct-vs-shim protocol as §2, plus one agent run per
+class (C1, R1, L1, A2). Raw logs: `/tmp/lib2_*_197{6,7}.json`,
+`/tmp/lib2agent_*.log` (machine-local, not committed).
+
+| prompt | direct `:1976` | via shim `:1977` | agent (`afm-agent` → `:1976`) | verdict |
+|---|---|---|---|---|
+| C1 `has_close_elements` | correct O(n²) fn, stop, no tools; executed 4/4 (incl. `[]`→False, dup→True) | correct fn; executed 4/4 | correct fn; executed 2/2 examples | **PASS all three** |
+| C2 `parse_nested_parens` | correct depth fn; executed `[2,3,1,3]`, `[1]`, `[4]` | byte-identical correct fn; executed 3/3 | n/a (class covered by C1 run) | **PASS (HTTP both)** |
+| C4 median even-fix | correct odd/even branches; `median([1,2,3,4])=2.5`, `([1,2,3])=2`; executed 4/4 | same; executed 4/4 | n/a | **PASS (HTTP both)** |
+| R1 Janet ducks (7 ducklings, adults=2×) | `21` | `21` | `21` | **PASS all three** |
+| R3 99 passes Alice→Bob→Claire→… | ` ```bash echo $((99 % 3)) ``` ` fence — **no answer, no call** | identical fence | n/a (class covered by R1 run) | **FAIL answer + MISS shape** (expected `Alice`; 99%3=0) |
+| L1 python+macOS versions via bash | **empty `content:""`, 1 completion token**, stop | **3× bash `tool_calls`**, finish `tool_calls` — but args degraded (`{}` twice, `{"command":"sw_vers"}` once) and content **hallucinates `Python 3.9.6` + `macOS 13.6.6 Ventura`** vs actual 3.11.16/27.2 | attempt 1: **empty log (0 bytes)**; attempt 2: unexecuted ` ```bash python3 --version / sw_vers ``` ` fence, no versions | **tool-choice PASS, answers FAIL**: shim translates, but single-turn content fabricates stale results; agent never executes |
+| L3 Sept-2026 iPhone event via webfetch | empty `content:""`, stop (same punt as L1) | "Sept 2026 is in the future… confirm the date" — **stale internal clock**, no fetch | n/a (class covered by L1 runs) | **FLAG**: no fabrication, but no tool use; model unaware today is 2026-09-27 |
+| A2 two fetches (python docs + W3Schools) then compare | **2× `call:default_api:webfetch` markers leak** (both URLs) + inline page-dump, stop | **2× clean webfetch `tool_calls`** (both URLs, `extract_main:true`), finish `tool_calls`; comparison already in content | markers leak → **safety-guardrail trip** → retry emits ` ```json {"tool_calls":[…]} ``` ` fence (both URLs correct) + **fabricated** ` ```text Output from webfetch calls… ` comparison; exit 1; **no real tool executed** | **shim translates multi-call correctly; agent loop via `:1976` cannot execute either shape** |
+| A3 fetch openai/human-eval, summarize | webfetch + **bash/curl-fallback markers leak** (tool-choice redundancy), stop; knowledge summary correct (164 problems, pass@k) | 2 `tool_calls` (webfetch clean; **bash args wrong-schema: `{"url":…}` not `{"command":…}`**), finish `tool_calls`; summary correct | n/a (class covered by A2 run) | **translation PASS with arg-schema MISS on bash** |
+
+New findings beyond §4:
+- **Multi-call works**: A2 shim yields 2 correct `tool_calls`; L1 shim yields 3
+  bash calls (arg quality degrades to `{}` on malformed payloads).
+- **Inline fabrication risk**: with no execution round-trip, the model writes
+  plausible-but-false tool results into `content` (L1 stale versions). The shim
+  fixes the envelope, not the facts — an agentic loop must execute the calls
+  and re-post outputs before answering.
+- **Arg-schema bleed**: `parseArgs`' webfetch-targeted fallback stamps
+  `{"url":…}` onto `bash` calls (A3). A per-tool arg mapper (bash→`command`)
+  would fix the common case.
+- **Guardrail interaction**: raw `<ctrl46>call:` text reaching the opencode
+  agent loop can trip safety guardrails (A2 agent, exit 1) — another reason to
+  route `afm-agent` through `:1977` so markers never surface as text.
 
 ## 5. Conclusion
 

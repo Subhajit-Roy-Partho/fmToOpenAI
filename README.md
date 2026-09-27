@@ -38,7 +38,22 @@ node shim.js                 # LISTEN :1977 -> UPSTREAM http://127.0.0.1:1976/v1
 AFM_SHIM_PORT=1977 AFM_UPSTREAM=http://127.0.0.1:1976/v1 node shim.js
 FM_STRIP_MARKERS=1 node shim.js   # strip markers without translating (fm-proxy style)
 node test.js                 # deterministic suite (no fm required)
+node loadtest.js             # parallel load probe: stub upstream + shim :1987 @ FM_WORKERS=3
+                             # (8 concurrent /v1/models + 4 concurrent canned POSTs + 1 SSE check)
 ```
+
+## Cluster workers (go-live: 3)
+
+`shim.js` uses stdlib-only Node `cluster`, flag-gated by `FM_WORKERS`
+(default 1 = single-process). `N=0` means auto (`min(cpus, 4)`); bad or
+negative values fall back to 1. Workers share one `:PORT` listener via the
+cluster scheduler — per-request state stays in-request, so concurrent
+translations never cross-talk (proven by `node loadtest.js`).
+
+Go-live default is **3 workers**, persisted in `shim.sh`
+(`: "${FM_WORKERS:=3}"`, exported on `start`); override per-call, e.g.
+`FM_WORKERS=1 ./shim.sh restart`. `./shim.sh status` reports the count
+(`workers N`, single `listeners 1` in both modes).
 
 ## opencode.jsonc snippet
 

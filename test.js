@@ -3,7 +3,7 @@
 // + optional live probe of :1976 (never fails the suite when fm is down).
 import assert from "node:assert";
 import http from "node:http";
-import { translateContent, translateFencedContent, translateResponse, extractCalls, extractFencedCalls, parseArgs, coerceToolArgs, createServer, sseTranslateAndRelay } from "./shim.js";
+import { translateContent, translateFencedContent, translateResponse, extractCalls, extractFencedCalls, parseArgs, coerceToolArgs, createServer, sseTranslateAndRelay, resolveWorkerCount } from "./shim.js";
 import { EventEmitter } from "node:events";
 
 let pass = 0;
@@ -329,6 +329,34 @@ await (async () => {
     console.log("PASS " + name);
   } catch (e) { console.error("FAIL " + name + ": " + (e?.message || e)); process.exitCode = 1; }
 })();
+
+// 23-26. resolveWorkerCount (cluster flag-gating, Phase 1)
+ok("workers: unset->1", () => {
+  assert.equal(resolveWorkerCount(undefined, 8), 1);
+  assert.equal(resolveWorkerCount(null, 8), 1);
+  assert.equal(resolveWorkerCount("", 8), 1);
+  assert.equal(resolveWorkerCount("   ", 8), 1);
+});
+
+ok("workers: 0->min(cpus,4)", () => {
+  assert.equal(resolveWorkerCount("0", 8), 4);
+  assert.equal(resolveWorkerCount(0, 16), 4);
+  assert.equal(resolveWorkerCount("0", 2), 2);
+  assert.equal(resolveWorkerCount("0", 1), 1);
+});
+
+ok("workers: N->N", () => {
+  assert.equal(resolveWorkerCount("3", 8), 3);
+  assert.equal(resolveWorkerCount("1", 8), 1);
+  assert.equal(resolveWorkerCount(2, 8), 2);
+});
+
+ok("workers: bad/negative->1", () => {
+  assert.equal(resolveWorkerCount("abc", 8), 1);
+  assert.equal(resolveWorkerCount("NaN", 8), 1);
+  assert.equal(resolveWorkerCount("-2", 8), 1);
+  assert.equal(resolveWorkerCount("-1", 8), 1);
+});
 
 // 17. shim server: /health + canned translation through HTTP
 const server = createServer();

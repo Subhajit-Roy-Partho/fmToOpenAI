@@ -373,3 +373,54 @@ execution is still unproven** — blocker this round is model sampling
 re-run this exact command until a sample emits `call:` markers (the
 prior session hit one on its first try), or re-run on `pcc` once quota
 recovers; either should now round-trip through the fixed framing.
+
+## 11. Cluster go-live + load proof (2026-09-27, this section)
+
+Design (Phase 1 commit `dfa33a9`, stdlib only, no deps): `shim.js` uses
+Node `cluster`, flag-gated by `FM_WORKERS` (default 1 = single-process,
+prior behaviour). `N=0` means auto (`min(cpus, 4)`); unset/blank,
+negative, and non-numeric all fall back to 1 (`resolveWorkerCount`,
+exported for tests). Concurrency safety: all buffered SSE state
+(`buf`/`template`/`accum`/`order`) is allocated inside the per-request
+`sseTranslateAndRelay` closure; the only module-level mutable state is
+the `callSeq` id counter (per-process memory per worker, plus a
+`randomUUID` prefix per id — no cross-worker collision). Workers share
+the single `:PORT` listener via the cluster scheduler; the primary
+respawns dead workers.
+
+Tests: `node test.js` **27/27** (was 23/23) — 4 new `resolveWorkerCount`
+unit tests pin unset→1, `0`→`min(cpus,4)` (4/2/1 cpus probed),
+`N`→`N`, bad/negative→1.
+
+Load probe (`loadtest.js`, deliberately NOT in the default `test.js`
+run — `node loadtest.js`): stub upstream (ephemeral port, serves
+`/v1/models` + canned `<ctrl46>call:default_api:webfetch{…example.com…}`
+non-stream and split-marker SSE completions, so no `:1976` needed) +
+real shim child on **`:1987` with `FM_WORKERS=3`** (never touches live
+`:1977`). Fired **8 concurrent `GET /v1/models` + 4 concurrent canned
+`POST /v1/chat/completions`** (12 in flight, Phase A wall **16 ms**)
+plus **1 SSE streaming translation check**: all 8 models replies correct
+(ids `[pcc,system]`, `x-afm-shim: 1`), all 4 POSTs translated
+(`webfetch https://example.com`, `content ""`, `finish tool_calls`),
+SSE emits exactly one `tool_calls` chunk with no `call:` leak and ends
+`data: [DONE]`. **13/13 passed**, test instance killed (`:1987` free
+after). No cross-talk between workers under concurrency.
+
+Go-live: `FM_WORKERS=3` persisted in `shim.sh`
+(`: "${FM_WORKERS:=3}"`, exported on `start`; override per-call, e.g.
+`FM_WORKERS=1 ./shim.sh restart`; worker docs added to README).
+`FM_WORKERS=3 ./shim.sh restart` → pid **61313**,
+`./shim.sh status` → `up (pid 61313, workers 3, listeners 1)`,
+`/health` 200 `{"status":"ok","upstream":"http://127.0.0.1:1976/v1"}`,
+single shared listener verified. Live check: R1 Janet-ducks via `:1977`
+(model `system`, `stream:false`) → **`21`**, `finish:stop`, no
+`tool_calls` — passthrough correct under 3 workers.
+
+pcc quota re-probe (5-token direct-`:1976` probe, same round):
+`pcc` → **still HTTP 429 `insufficient_quota`** ("Your quota has been
+reached"; arrives as an SSE `error` event inside an HTTP 200 body);
+`system` → healthy (`ok`). So the `example.com` webfetch e2e for the
+tool-execution proof stays blocked — recorded still-429, no e2e this
+round. Incidental: omitting the `stream` key makes upstream return SSE
+even for a completion request; the shim fails open (forwards the stream
+verbatim, canonical role→content→finish→`[DONE]` shape holds).

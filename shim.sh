@@ -10,6 +10,11 @@ CMD="${2:-$1}"
 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then PORT="$1"; CMD="${2:-status}"; else PORT="${2:-${AFM_SHIM_PORT:-1977}}"; CMD="${1:-status}"; fi
 PIDFILE="/tmp/afm-openai-shim.${PORT}.pid"
 LOG="$DIR/shim.${PORT}.log"
+# Cluster go-live (Phase 2): default 3 workers sharing :PORT via the Node
+# cluster scheduler (single shared listener; `status` shows the count).
+# Override per-call, e.g. `FM_WORKERS=1 ./shim.sh restart`.
+: "${FM_WORKERS:=3}"
+export FM_WORKERS
 
 is_up() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
@@ -39,7 +44,7 @@ case "$CMD" in
     LEFTOVER="$(lsof -ti :"$PORT" 2>/dev/null | head -1)"
     if [ -n "$LEFTOVER" ]; then kill -9 "$LEFTOVER" 2>/dev/null; sleep 0.5; fi
     rm -f "$PIDFILE"
-    (cd "$DIR" && AFM_SHIM_PORT="$PORT" nohup node shim.js >>"$LOG" 2>&1 &)
+    (cd "$DIR" && FM_WORKERS="$FM_WORKERS" AFM_SHIM_PORT="$PORT" nohup node shim.js >>"$LOG" 2>&1 &)
     # pidfile = actual TCP listener (nohup/subshell pids are unreliable)
     PID=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do

@@ -303,3 +303,73 @@ So: **split-chunk translation is proven by the canned 20/20 regression,
 but live end-to-end afm-agent tool execution is still unproven** —
 blocker this round is upstream quota, not shim logic. Re-run this
 section's lib-2 + e2e cells once `:1976` quota recovers.
+
+## 10. OpenAI-Chat framing fix + e2e on `system` (2026-09-27, this section)
+
+Smoking gun (prior session): first real end-to-end translation via
+`timeout 170 opencode run --model apple-fm/system --agent afm-agent
+"Fetch https://example.com and quote its title. Use webfetch."` failed
+with opencode error `OpenAI Chat received content after the finish
+reason`, while `shim.1977.log` showed `[shim] translated 1 tool_call(s):
+webfetch` — translation fired, but the emitted framing was rejected.
+
+Two framing bugs found in `shim.js`, both fixed with regex/deterministic
+changes only (`node --check shim.js` exit 0, `node test.js` **23/23**,
+was 20/20):
+(a) **content+tool_calls in one message/delta.** `translateContent` /
+`translateFencedContent` returned residue prose in `content` alongside
+`tool_calls`, and both re-emit paths forwarded it inline. Now: any
+message/delta carrying `tool_calls` has `content: ""` (empty string,
+consistent with the shim's existing `cleaned || ""` framing — null is
+not used anywhere); residue prose is split out into `residue` and
+re-emitted as a SEPARATE preceding content-only chunk (SSE) or dropped
+from the wire with a `[shim] residue prose kept out of tool_calls
+message:` log line (non-stream, which has no preceding-chunk slot).
+Canned tests 20 (non-stream prose+marker → `content ""` + 1 call) and 21
+(SSE prose+marker → no delta carries both text and tool_calls, residue
+chunk precedes the calls chunk) pin this.
+(b) **finish_reason forwarded before the buffered content re-emit
+(the actual e2e killer).** The relay forwarded finish-only frames
+immediately but held content for the translate-at-`[DONE]` re-emit, so
+clients saw `finish_reason` and THEN a content chunk — exactly the
+reported error. Reproduced live: a streaming POST through `:1977`
+returned role-chunk, `finish:stop` chunk, content chunk, `[DONE]`.
+Now finish frames are held like content; the re-emit uses canonical
+OpenAI SSE shape — content/tool_calls deltas always carry
+`finish_reason: null`, finish arrives in a DEDICATED terminal chunk with
+an empty delta, nothing but `[DONE]` follows. Canned test 22
+(role→content→finish→`[DONE]` in, assert no content chunk after any
+finish chunk, content verbatim, finish still delivered) pins this; tests
+19/21 updated to the terminal-finish shape. Live re-verified through
+`:1977`: role → content(`finish:null`) → finish-only(`stop`) → `[DONE]`.
+
+Hygiene: `shim.1977.log` showed `EADDRINUSE` + stacked `listening`
+lines — `shim.sh restart` left orphans. `shim.sh` now: on `start`, kills
+the pidfile pid AND `pkill -f "node shim.js"` lingerers, waits for the
+port to free (SIGKILL last resort), reaps extra listeners when the
+pidfile is alive but the port has >1 listener, and verifies exactly one
+listener after start (`stop` verifies the port is free). `./shim.sh
+restart` → pid 60676, pidfile == `lsof -ti :1977`, `/health` ok, single
+listener verified (also verified on the previous restart, pid 60578).
+
+E2E (model pick: `pcc` re-probed immediately before the runs with a
+5-token probe — still HTTP 429 `insufficient_quota`; `system` probed
+healthy, so all runs use `--model apple-fm/system`):
+`timeout 170 opencode run --model apple-fm/system --agent afm-agent
+"Fetch https://example.com and quote its title. Use webfetch."` from
+`/tmp/afm-agent-check2`, 3 samples → **exit 0, no converter error, in
+all three** (the reported `content after the finish reason` failure is
+gone). No new `[shim] translated` line in any run (the single such line
+in `shim.1977.log` predates this section's restarts): the `system`
+samples emitted zero markers — (1) a vague conversation summary,
+(2) a clarifying question ("Please confirm that you want me to fetch…"),
+(3) bare intent narration ("I will fetch the title… Proceeding now.")
+— so the shim correctly passed everything through and there was nothing
+to execute. Logs `/tmp/e2e_framing_system{2,3,4}.log` (machine-local).
+So: **the converter-blocking framing bug is fixed and proven live
+(exit 1 → exit 0 on the identical command), but live end-to-end tool
+execution is still unproven** — blocker this round is model sampling
+(`system` emitting narration instead of markers), not shim logic. Next:
+re-run this exact command until a sample emits `call:` markers (the
+prior session hit one on its first try), or re-run on `pcc` once quota
+recovers; either should now round-trip through the fixed framing.

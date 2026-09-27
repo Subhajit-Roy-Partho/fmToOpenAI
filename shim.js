@@ -12,7 +12,11 @@
 // Behaviour:
 //   - forward /v1/models + /v1/chat/completions (stream:false and SSE stream:true)
 //   - on match emit OpenAI tool_calls:[{id,type:function,function:{name,arguments}}],
-//     finish_reason=tool_calls, strip residue from content
+//     finish_reason=tool_calls; the tool_calls message/delta ALWAYS carries
+//     content "" (framing rule §10 — opencode's OpenAI-Chat converter rejects
+//     content bundled with tool_calls), residue prose goes out as a SEPARATE
+//     preceding content-only chunk (SSE) or is dropped from the wire with a
+//     log line (non-stream, which has no preceding-chunk slot)
 //   - multiple calls per content supported; malformed input fails open (passthrough)
 //   - FM_STRIP_MARKERS=1: strip markers without translating (fm-proxy style)
 //   - tool_choice required/named: trivial response_format rewrite attempt, else passthrough
@@ -290,7 +294,12 @@ export function translateContent(content) {
       tool_calls.push(toToolCall(c.name, coerced));
     }
     if (tool_calls.length === 0) return { content };
-    return { content: cleaned || "", tool_calls, finish_reason: "tool_calls" };
+    // Framing rule (§10): a message/delta carrying tool_calls MUST have
+    // content "" — opencode's OpenAI-Chat converter rejects content bundled
+    // with tool_calls ("received content after the finish reason"). Surrounding
+    // prose survives in `residue` so callers can re-emit it as a SEPARATE
+    // preceding content-only chunk; never inline it with the calls.
+    return { content: "", residue: cleaned || "", tool_calls, finish_reason: "tool_calls" };
   } catch {
     return { content };
   }
@@ -308,7 +317,8 @@ export function translateFencedContent(content) {
       tool_calls.push(toToolCall(c.name, coerced, { id: c.id }));
     }
     if (tool_calls.length === 0) return { content };
-    return { content: cleaned || "", tool_calls, finish_reason: "tool_calls" };
+    // Same framing rule as above: content "" + residue split out.
+    return { content: "", residue: cleaned || "", tool_calls, finish_reason: "tool_calls" };
   } catch {
     return { content };
   }
@@ -327,9 +337,14 @@ export function translateResponse(obj) {
       if (typeof r.content === "string" && r.content !== before) { msg.content = r.content; return true; }
       return false;
     }
-    msg.content = r.content;
+    // Framing rule (§10): the tool_calls message carries content "" (r.content
+    // is already ""). Non-stream has no preceding-chunk slot, so residue prose
+    // is dropped from the wire here (one log line, below) — never inlined
+    // with the calls.
+    msg.content = "";
     msg.tool_calls = r.tool_calls;
     if (r.finish_reason) choice.finish_reason = r.finish_reason;
+    if (r.residue) console.error("[shim] residue prose kept out of tool_calls message: " + JSON.stringify(r.residue.slice(0, 120)));
     return true;
   } catch {
     return false;
@@ -390,7 +405,9 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
   // `<ctrl46>call:…` marker is routinely split mid-name or mid-JSON across
   // chunks and per-chunk translateContent() can never fire. Instead we
   // accumulate the full delta.content per choice index, forward only
-  // non-content frames immediately (role, keep-alives), and run the existing
+  // role-only/keep-alive frames immediately (no content, no finish_reason —
+  // finish is held and lands on/after the final re-emitted chunk, §10), and
+  // run the existing
   // translateContent() ONCE over the assembled content at [DONE]/end. The
   // translated result is re-emitted as final SSE chunk(s) before [DONE], so
   // SSE event framing to the client is always valid.
@@ -425,34 +442,42 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
       model: "pcc",
     };
     if (order.length === 0) return; // nothing buffered (empty punt etc.)
+    // Canonical OpenAI SSE shape (§10): content/tool_calls deltas always carry
+    // finish_reason null; finish arrives in a DEDICATED terminal chunk with an
+    // empty delta. Never co-locate content text and a finish reason, and never
+    // emit anything (except [DONE]) after the finish chunk.
+    const emit = (idx, delta, finish) => {
+      clientRes.write("data: " + JSON.stringify({ ...tpl, choices: [{ index: idx, delta, finish_reason: finish }] }) + "\n\n");
+    };
     for (const idx of order) {
       const a = accum.get(idx);
+      const role = a.role || "assistant";
       const full = a.content;
       if (!full) {
-        if (a.finish) {
-          clientRes.write("data: " + JSON.stringify({ ...tpl, choices: [{ index: idx, delta: {}, finish_reason: a.finish }] }) + "\n\n");
-        }
+        if (a.finish) emit(idx, {}, a.finish);
         continue;
       }
       let r;
       try { r = translateContent(full); } catch { r = { content: full }; }
       if (r && r.tool_calls) {
-        clientRes.write("data: " + JSON.stringify({
-          ...tpl,
-          choices: [{ index: idx, delta: { role: a.role || "assistant", content: r.content || "", tool_calls: r.tool_calls }, finish_reason: r.finish_reason || "tool_calls" }],
-        }) + "\n\n");
+        // Framing rule (§10): never emit content text + tool_calls in one
+        // delta (opencode's converter rejects it). Residue prose (if any) goes
+        // out FIRST as its own content-only chunk; the tool_calls delta always
+        // carries content "".
+        if (r.residue) emit(idx, { role, content: r.residue }, null);
+        emit(idx, { role, content: "", tool_calls: r.tool_calls }, null);
+        emit(idx, {}, r.finish_reason || "tool_calls");
         // Log line matches the non-streaming path's `[shim] translated N
         // tool_call(s):` prefix so one grep covers both (suffix notes SSE).
         console.error("[shim] translated " + r.tool_calls.length + " tool_call(s): " + r.tool_calls.map((t) => (t && t.function && t.function.name) || "?").join(",") + " (sse, buffered)");
       } else if (typeof r.content === "string" && r.content !== full) {
-        clientRes.write("data: " + JSON.stringify({
-          ...tpl, choices: [{ index: idx, delta: { role: a.role || "assistant", content: r.content }, finish_reason: a.finish || null }],
-        }) + "\n\n");
+        emit(idx, { role, content: r.content }, null);
+        if (a.finish) emit(idx, {}, a.finish);
       } else {
-        // No translation: re-emit the assembled content verbatim as one chunk.
-        clientRes.write("data: " + JSON.stringify({
-          ...tpl, choices: [{ index: idx, delta: { role: a.role || "assistant", content: full }, finish_reason: a.finish || null }],
-        }) + "\n\n");
+        // No translation: re-emit the assembled content verbatim, then the
+        // held finish in its own terminal chunk.
+        emit(idx, { role, content: full }, null);
+        if (a.finish) emit(idx, {}, a.finish);
       }
     }
   };
@@ -468,6 +493,12 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
     try {
       noteTemplate(obj);
       let hasContent = false;
+      // Ordering rule (§10): a finish_reason frame MUST NOT go out before the
+      // buffered content re-emit — strict OpenAI-Chat converters reject
+      // content arriving after a finish reason. So finish frames are held
+      // (recorded in accum, applied at flush) like content; only role-only /
+      // keep-alive frames (no content, no finish) pass through immediately.
+      let hasFinish = false;
       for (const ch of obj?.choices || []) {
         const idx = (ch && typeof ch.index === "number") ? ch.index : 0;
         const a = ensure(idx);
@@ -476,10 +507,11 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
           if (typeof delta.role === "string" && delta.role) a.role = delta.role;
           if (typeof delta.content === "string") { a.content += delta.content; hasContent = true; }
         }
-        if (ch && ch.finish_reason !== undefined && ch.finish_reason !== null) a.finish = ch.finish_reason;
+        if (ch && ch.finish_reason !== undefined && ch.finish_reason !== null) { a.finish = ch.finish_reason; hasFinish = true; }
       }
-      if (!hasContent) clientRes.write("data: " + JSON.stringify(obj) + "\n\n"); // role/finish-only frames pass through
-      // content-bearing frames are held for the buffered re-emit at [DONE]
+      if (!hasContent && !hasFinish) clientRes.write("data: " + JSON.stringify(obj) + "\n\n");
+      // content- and finish-bearing frames are held for the buffered re-emit
+      // at [DONE], where finish lands on/after the final content chunk
     } catch { clientRes.write(event + "\n\n"); }
   };
   upstreamRes.on("data", (chunk) => {

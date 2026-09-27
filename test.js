@@ -206,12 +206,125 @@ await (async () => {
     const tc = withCalls[0].choices[0].delta.tool_calls[0];
     assert.equal(tc.function.name, "webfetch");
     assert.equal(JSON.parse(tc.function.arguments).url, "https://example.com");
-    assert.equal(withCalls[0].choices[0].finish_reason, "tool_calls");
+    assert.equal(withCalls[0].choices[0].finish_reason, null, "tool_calls delta carries no finish");
+    const term19 = objs[objs.length - 1].choices[0];
+    assert.deepEqual(term19.delta, {}, "terminal chunk has empty delta");
+    assert.equal(term19.finish_reason, "tool_calls", "finish arrives in its own terminal chunk");
     for (const o of objs) {
       for (const c of o.choices || []) {
         assert.ok(!String(c.delta?.content || "").includes("call:"), "no marker leak in re-emit");
       }
     }
+    pass++;
+    console.log("PASS " + name);
+  } catch (e) { console.error("FAIL " + name + ": " + (e?.message || e)); process.exitCode = 1; }
+})();
+
+// 20. Framing rule (§10a): non-stream marker with surrounding prose emits
+// content "" + tool_calls; residue is split out, never inlined.
+ok("framing: prose+marker non-stream", () => {
+  const raw = "Sure, fetching that now \x16call:default_api:webfetch{url:https://example.com}\x17 one moment";
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.equal(r.content, "", "content empty when tool_calls present");
+  assert.ok(r.residue && r.residue.includes("Sure, fetching"), "residue carries prose");
+  const obj = { choices: [{ message: { role: "assistant", content: raw }, finish_reason: "stop" }] };
+  assert.equal(translateResponse(obj), true);
+  const msg = obj.choices[0].message;
+  assert.equal(msg.content, "", "wire content empty");
+  assert.ok(msg.tool_calls && msg.tool_calls.length === 1, "wire has the call");
+  assert.equal(msg.tool_calls[0].function.name, "webfetch");
+  assert.equal(obj.choices[0].finish_reason, "tool_calls");
+});
+
+// 21. Framing rule (§10b): canned SSE with prose+marker — no single delta
+// carries both content text and tool_calls; residue precedes the calls.
+await (async () => {
+  const name = "framing: SSE prose+marker split chunks";
+  try {
+    const full = "Let me look that up for you \x16call:default_api:webfetch{url:https://example.com}\x17 hold on";
+    const pieces = [full.slice(0, 20), full.slice(20, 55), full.slice(55)];
+    assert.equal(pieces.join(""), full, "pieces reassemble");
+    const sseBody = pieces.map((c) => "data: " + JSON.stringify({ id: "y", object: "chat.completion.chunk", created: 1, model: "system", choices: [{ index: 0, delta: { role: "assistant", content: c }, finish_reason: null }] }) + "\n\n").join("") + "data: [DONE]\n\n";
+    const frags = [];
+    for (let i = 0; i < sseBody.length; i += 37) frags.push(sseBody.slice(i, i + 37));
+    const up = new EventEmitter();
+    up.statusCode = 200;
+    const writes = [];
+    let ended = false;
+    const client = { writeHead() {}, write(c) { writes.push(String(c)); }, end() { ended = true; } };
+    sseTranslateAndRelay(up, client);
+    for (const f of frags) up.emit("data", Buffer.from(f, "utf8"));
+    up.emit("end");
+    assert.ok(ended, "client ended");
+    const raw = writes.join("");
+    assert.ok(raw.endsWith("data: [DONE]\n\n"), "framing ends with [DONE]");
+    const payloads = raw.split("\n\n").filter((e) => e.startsWith("data:")).map((e) => e.slice(5).trim());
+    assert.ok(payloads[payloads.length - 1] === "[DONE]", "last payload is [DONE]");
+    const objs = payloads.slice(0, -1).map((p) => JSON.parse(p));
+    for (const o of objs) {
+      for (const c of o.choices || []) {
+        const hasText = typeof c.delta?.content === "string" && c.delta.content.length > 0;
+        const hasCalls = Array.isArray(c.delta?.tool_calls) && c.delta.tool_calls.length > 0;
+        assert.ok(!(hasText && hasCalls), "no delta carries both content text and tool_calls");
+      }
+    }
+    const withCalls = objs.filter((o) => (o.choices || []).some((c) => c.delta && c.delta.tool_calls));
+    assert.equal(withCalls.length, 1, "exactly one tool_calls chunk");
+    assert.equal(withCalls[0].choices[0].delta.content, "", "tool_calls chunk content empty");
+    assert.equal(withCalls[0].choices[0].delta.tool_calls[0].function.name, "webfetch");
+    assert.equal(JSON.parse(withCalls[0].choices[0].delta.tool_calls[0].function.arguments).url, "https://example.com");
+    assert.equal(withCalls[0].choices[0].finish_reason, null, "tool_calls delta carries no finish");
+    const term21 = objs[objs.length - 1].choices[0];
+    assert.deepEqual(term21.delta, {}, "terminal chunk has empty delta");
+    assert.equal(term21.finish_reason, "tool_calls", "finish arrives in its own terminal chunk");
+    const textChunks = objs.filter((o) => (o.choices || []).some((c) => typeof c.delta?.content === "string" && c.delta.content.length > 0));
+    assert.equal(textChunks.length, 1, "exactly one residue chunk");
+    assert.ok(textChunks[0].choices[0].delta.content.includes("Let me look that up"), "residue prose preserved");
+    assert.ok(raw.indexOf("Let me look that up") < raw.indexOf("tool_calls"), "residue precedes calls on the wire");
+    pass++;
+    console.log("PASS " + name);
+  } catch (e) { console.error("FAIL " + name + ": " + (e?.message || e)); process.exitCode = 1; }
+})();
+
+// 22. Ordering rule (§10c): live FM order is role → content… → finish →
+// [DONE]; the relay must never emit content AFTER a finish_reason chunk
+// (opencode: "received content after the finish reason"). Finish is held and
+// lands on/after the final content chunk.
+await (async () => {
+  const name = "ordering: no content after finish_reason";
+  try {
+    const ev = (o) => "data: " + JSON.stringify(o) + "\n\n";
+    const sseBody =
+      ev({ id: "z", object: "chat.completion.chunk", created: 1, model: "system", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }) +
+      ev({ id: "z", object: "chat.completion.chunk", created: 1, model: "system", choices: [{ index: 0, delta: { content: "Hello " }, finish_reason: null }] }) +
+      ev({ id: "z", object: "chat.completion.chunk", created: 1, model: "system", choices: [{ index: 0, delta: { content: "world" }, finish_reason: null }] }) +
+      ev({ id: "z", object: "chat.completion.chunk", created: 1, model: "system", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
+      "data: [DONE]\n\n";
+    const up = new EventEmitter();
+    up.statusCode = 200;
+    const writes = [];
+    let ended = false;
+    const client = { writeHead() {}, write(c) { writes.push(String(c)); }, end() { ended = true; } };
+    sseTranslateAndRelay(up, client);
+    up.emit("data", Buffer.from(sseBody, "utf8"));
+    up.emit("end");
+    assert.ok(ended, "client ended");
+    const raw = writes.join("");
+    const payloads = raw.split("\n\n").filter((e) => e.startsWith("data:")).map((e) => e.slice(5).trim());
+    assert.ok(payloads[payloads.length - 1] === "[DONE]", "last payload is [DONE]");
+    const objs = payloads.slice(0, -1).map((p) => JSON.parse(p));
+    let finishSeen = false;
+    for (const o of objs) {
+      for (const c of o.choices || []) {
+        if (c.finish_reason !== undefined && c.finish_reason !== null) finishSeen = true;
+        const hasText = typeof c.delta?.content === "string" && c.delta.content.length > 0;
+        assert.ok(!(finishSeen && hasText), "content chunk after a finish_reason chunk");
+      }
+    }
+    assert.ok(finishSeen, "finish_reason still delivered");
+    const joined = objs.map((o) => (o.choices || []).map((c) => c.delta?.content || "").join("")).join("");
+    assert.ok(joined.includes("Hello world"), "content preserved verbatim: " + JSON.stringify(joined));
     pass++;
     console.log("PASS " + name);
   } catch (e) { console.error("FAIL " + name + ": " + (e?.message || e)); process.exitCode = 1; }

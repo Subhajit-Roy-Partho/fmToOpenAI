@@ -141,6 +141,39 @@ ok("json tool_name fence", () => {
   assert.equal(JSON.parse(r.tool_calls[0].function.arguments).url, "https://example.com");
 });
 
+// 27. Stray-brace double-wrap (§4 miss #5): FM closes calls as
+// `...}<ctrl46>}<ctrl45>` — the marker-wrapped stray `}` must not leak
+// into residue (it surfaced as a leading `}` in SSE content chunks).
+ok("stray-brace double-wrap stripped", () => {
+  const raw = "<ctrl46>call:default_api:webfetch{extract_main:true,url:<ctrl46>https://example.com<ctrl46>}<ctrl46>}<ctrl45>The page is a placeholder.";
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.equal(r.content, "", "content empty");
+  assert.equal(r.residue, "The page is a placeholder.", "no leading stray brace");
+  const args = JSON.parse(r.tool_calls[0].function.arguments);
+  assert.equal(args.url, "https://example.com");
+  assert.equal(args.extract_main, true);
+});
+
+// 28. Stray-brace skip keeps multi-call boundaries + leaves malformed
+// non-`call:` dups in residue (fail open, never translated).
+ok("stray-brace multi-call intact", () => {
+  const raw = "<ctrl46>call:default_api:webfetch{extract_main:true,url:<ctrl46>https://docs.python.org/3/library/functions.html<ctrl46>}<ctrl46>call:default_api:webfetch{extract_main:true,url:<ctrl46>https://www.w3schools.com/python/python_functions.asp<ctrl46>}<ctrl46>}<ctrl45><ctrl46>call:default_api:webfetch{extract_main:true,url:<ctrl46>https://docs.python.org/3/library/functions.html<ctrl46>}<ctrl46>},default_api:webfetch{extract_main:true,url:<ctrl46>https://www.w3schools.com/python/python_functions.asp<ctrl46>}<ctrl46>}<ctrl45>I fetched both pages.";
+  const r = translateContent(raw);
+  assert.equal(r.tool_calls.length, 3, "three well-formed calls");
+  assert.equal(r.content, "", "content empty");
+  assert.ok(!r.residue.startsWith("}"), "no leading stray brace: " + JSON.stringify(r.residue.slice(0, 40)));
+  assert.ok(r.residue.endsWith("I fetched both pages."), "prose preserved");
+});
+
+// 29. Guard: a bare `}` with NO adjacent markers is prose, never consumed.
+ok("bare brace without markers preserved", () => {
+  const raw = "call:default_api:get_time{} } not a marker wrap";
+  const r = translateContent(raw);
+  assert.ok(r.tool_calls && r.tool_calls.length === 1, "one tool_call");
+  assert.equal(r.residue, "} not a marker wrap", "bare brace kept");
+});
+
 // 15. non-tool fences (```text results, bare JSON) never translate
 ok("non-tool fences passthrough", () => {
   const raw = '```json\n[{"result": "Python docs intro..."}]\n```';
@@ -356,6 +389,17 @@ ok("workers: bad/negative->1", () => {
   assert.equal(resolveWorkerCount("NaN", 8), 1);
   assert.equal(resolveWorkerCount("-2", 8), 1);
   assert.equal(resolveWorkerCount("-1", 8), 1);
+});
+
+// 30. Guard: `in_tool:default_api:*` prose echo (no `call:` prefix, no
+// markers) is narration, never a call — translating it would duplicate
+// the real `call:` markers it echoes (live c_bash SSE sample emitted 2
+// genuine bash calls plus this residue).
+ok("in_tool prose echo passthrough", () => {
+  const raw = "in_tool:default_api:bash{command:sw_vers}";
+  const r = translateContent(raw);
+  assert.equal(r.content, raw);
+  assert.equal(r.tool_calls, undefined);
 });
 
 // 17. shim server: /health + canned translation through HTTP

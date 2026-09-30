@@ -107,6 +107,15 @@ export function extractCalls(content) {
     calls.push({ name, argsText });
     out.push(text.slice(last, m.index));
     last = end + 1;
+    // Stray-brace skip (§4 miss #5): FM double-wraps the close as
+    // `...}<ctrl46>}<ctrl45>`, i.e. normalised `...}\x16}\x17`. The balanced
+    // scan above stops at the payload's own `}`, leaving a marker-wrapped
+    // stray `}` that would otherwise leak into residue (visible as a
+    // leading `}` in SSE content chunks). Skip one immediately-following
+    // `}` ONLY when it is marker-adjacent (the skipped span contains
+    // \x16/\x17) — bare `}` prose without markers is never consumed.
+    const tail = text.slice(last).match(/^[\s\x16\x17]*\}[\s\x16\x17]*/);
+    if (tail && /[\x16\x17]/.test(tail[0])) last += tail[0].length;
     re.lastIndex = last;
   }
   out.push(text.slice(last));
@@ -398,6 +407,42 @@ export function rewriteRequestBody(body) {
   }
 }
 
+// ---- quota-error detection --------------------------------------------------
+// Upstream FM surfaces quota exhaustion two ways:
+//   1) HTTP 429 JSON: {"error":{"message":"Your quota has been reached. ...",
+//      "code":"429","type":"insufficient_quota"}}
+//   2) the SAME error object as an SSE `data:` event inside an HTTP 200
+//      stream (direct :1976 vs shim :1977 A/B must match status).
+// isQuotaError(objOrString) is true when the value indicates 429 /
+// insufficient_quota / "quota has been reached". Stdlib only.
+export function isQuotaError(objOrString) {
+  try {
+    let obj = objOrString;
+    if (typeof obj === "string") {
+      const s = obj;
+      if (/insufficient_quota/i.test(s) || /quota has been reached/i.test(s)) return true;
+      const t = s.trim();
+      // Bare "429" code inside an error-looking payload still counts.
+      if (/\"code\"\s*:\s*\"?429\"?/.test(t) && /error/i.test(t)) return true;
+      try { obj = JSON.parse(s); } catch { return false; }
+    }
+    if (!obj || typeof obj !== "object") return false;
+    const err = obj.error && typeof obj.error === "object" ? obj.error : null;
+    const candidates = [];
+    if (err) candidates.push(err);
+    candidates.push(obj);
+    for (const c of candidates) {
+      if (c.code === 429 || c.code === "429") return true;
+      if (typeof c.type === "string" && /quota/i.test(c.type)) return true;
+      if (typeof c.message === "string" &&
+        (/insufficient_quota/i.test(c.message) || /quota has been reached/i.test(c.message))) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // ---- proxy ----------------------------------------------------------------
 function sendJson(res, status, obj) {
   const data = JSON.stringify(obj);
@@ -429,18 +474,60 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
   // Upstream FM SSE deltas arrive in arbitrary TCP/SSE fragments, so a
   // `<ctrl46>call:…` marker is routinely split mid-name or mid-JSON across
   // chunks and per-chunk translateContent() can never fire. Instead we
-  // accumulate the full delta.content per choice index, forward only
-  // role-only/keep-alive frames immediately (no content, no finish_reason —
-  // finish is held and lands on/after the final re-emitted chunk, §10), and
+  // accumulate the full delta.content per choice index, HOLD role-only /
+  // keep-alive bytes unsent (headers deferred so an early error frame can
+  // still upgrade the response to 429), and
   // run the existing
   // translateContent() ONCE over the assembled content at [DONE]/end. The
   // translated result is re-emitted as final SSE chunk(s) before [DONE], so
   // SSE event framing to the client is always valid.
-  clientRes.writeHead(upstreamRes.statusCode || 200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
+  // Quota errors may arrive as SSE `data:` JSON inside an HTTP 200, so the
+  // 200 SSE headers MUST NOT go out before the first data frame is
+  // inspected — otherwise the status can never be upgraded to 429. All
+  // SSE writes go through ensureSseHead() (lazy); a quota frame seen
+  // before any SSE byte upgrades the whole response to a single 429 JSON.
+  let sseHeadSent = false;
+  let quotaDone = false;
+  const ensureSseHead = () => {
+    if (sseHeadSent || quotaDone) return;
+    sseHeadSent = true;
+    clientRes.writeHead(upstreamRes.statusCode || 200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+  };
+  // Live quota shape is role-only frame(s) THEN `event: error` + error
+  // JSON — all inside HTTP 200. So role-only/keep-alive/fail-open bytes
+  // are HELD in `pending` (headers unsent) and only released once a later
+  // frame proves the stream is healthy (content/finish arrives) or the
+  // stream closes ([DONE]/end). An error frame seen while held upgrades
+  // the whole response to a single 429 JSON instead of a 200 stream.
+  const pending = [];
+  const flushPending = () => {
+    if (quotaDone) return;
+    ensureSseHead();
+    for (const w of pending) clientRes.write(w);
+    pending.length = 0;
+  };
+  const sendQuotaError = (obj) => {
+    if (sseHeadSent || quotaDone) return false;
+    quotaDone = true;
+    pending.length = 0; // drop held role/keep-alive bytes: 429 replaces the stream
+    let data;
+    try { data = JSON.stringify(obj); } catch { data = '{"error":{"message":"quota exceeded","code":"429","type":"insufficient_quota"}}'; }
+    console.error("[shim] quota exceeded — surfacing 429 (sse)");
+    try {
+      clientRes.writeHead(429, {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(data),
+        "x-afm-shim": "1",
+      });
+    } catch {}
+    try { clientRes.end(data); } catch {}
+    try { if (typeof upstreamRes.destroy === "function") upstreamRes.destroy(); } catch {}
+    return true;
+  };
   let buf = "";
   let template = null; // {id, object, created, model} from first chunk
   const accum = new Map(); // index -> { content, role, finish }
@@ -472,6 +559,7 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
     // empty delta. Never co-locate content text and a finish reason, and never
     // emit anything (except [DONE]) after the finish chunk.
     const emit = (idx, delta, finish) => {
+      ensureSseHead();
       clientRes.write("data: " + JSON.stringify({ ...tpl, choices: [{ index: idx, delta, finish_reason: finish }] }) + "\n\n");
     };
     for (const idx of order) {
@@ -508,21 +596,37 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
   };
   let doneSeen = false;
   const handleEvent = (event) => {
+    if (quotaDone) return;
     const lines = event.split("\n");
     const dataLines = lines.filter((l) => l.startsWith("data:"));
-    if (dataLines.length === 0) { clientRes.write(event + "\n\n"); return; } // comment/keep-alive
+    if (dataLines.length === 0) { pending.push(event + "\n\n"); return; } // comment/keep-alive (held)
     const payload = dataLines.map((l) => l.slice(5).trimStart()).join("\n");
-    if (payload === "[DONE]") { doneSeen = true; flushTranslated(); clientRes.write("data: [DONE]\n\n"); return; }
+    if (payload === "[DONE]") { doneSeen = true; flushPending(); flushTranslated(); clientRes.write("data: [DONE]\n\n"); return; }
     let obj;
-    try { obj = JSON.parse(payload); } catch { clientRes.write(event + "\n\n"); return; } // fail open
+    try { obj = JSON.parse(payload); } catch {
+      // Fail open — but a quota message split as raw text still counts.
+      if (isQuotaError(payload)) {
+        if (!sendQuotaError({ error: { message: payload.slice(0, 500), code: "429", type: "insufficient_quota" } })) { flushPending(); clientRes.write(event + "\n\n"); }
+        return;
+      }
+      pending.push(event + "\n\n"); return;
+    }
+    // Quota error inside the stream upgrades the whole response to 429
+    // JSON (possible while headers+bytes are still held). Past that point
+    // the error is forwarded verbatim (fail open) so it is never dropped.
+    if (isQuotaError(obj) || isQuotaError(payload)) {
+      if (!sendQuotaError(obj)) { flushPending(); clientRes.write(event + "\n\n"); }
+      return;
+    }
     try {
       noteTemplate(obj);
       let hasContent = false;
       // Ordering rule (§10): a finish_reason frame MUST NOT go out before the
       // buffered content re-emit — strict OpenAI-Chat converters reject
       // content arriving after a finish reason. So finish frames are held
-      // (recorded in accum, applied at flush) like content; only role-only /
-      // keep-alive frames (no content, no finish) pass through immediately.
+      // (recorded in accum, applied at flush) like content; role-only /
+      // keep-alive frames are HELD unsent (headers deferred for the quota
+      // upgrade) and released once content/finish proves the stream healthy.
       let hasFinish = false;
       for (const ch of obj?.choices || []) {
         const idx = (ch && typeof ch.index === "number") ? ch.index : 0;
@@ -534,30 +638,49 @@ export function sseTranslateAndRelay(upstreamRes, clientRes) {
         }
         if (ch && ch.finish_reason !== undefined && ch.finish_reason !== null) { a.finish = ch.finish_reason; hasFinish = true; }
       }
-      if (!hasContent && !hasFinish) clientRes.write("data: " + JSON.stringify(obj) + "\n\n");
+      if (!hasContent && !hasFinish) { pending.push("data: " + JSON.stringify(obj) + "\n\n"); }
+      else flushPending(); // stream proven healthy: release held role bytes
       // content- and finish-bearing frames are held for the buffered re-emit
       // at [DONE], where finish lands on/after the final content chunk
-    } catch { clientRes.write(event + "\n\n"); }
+    } catch { pending.push(event + "\n\n"); }
   };
   upstreamRes.on("data", (chunk) => {
+    if (quotaDone) return;
     buf += chunk.toString("utf8");
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const event = buf.slice(0, idx);
       buf = buf.slice(idx + 2);
       handleEvent(event);
+      if (quotaDone) { buf = ""; return; }
     }
   });
   upstreamRes.on("end", () => {
+    if (quotaDone) return;
     try {
       // Leftover partial frame (no trailing \n\n): parse if it holds data.
-      if (buf.trim()) handleEvent(buf);
-      if (!doneSeen) { flushTranslated(); clientRes.write("data: [DONE]\n\n"); }
+      // A non-SSE JSON error body on a stream request (e.g. upstream 429
+      // with content-type json) lands here whole — still upgrade to 429.
+      if (buf.trim()) {
+        const tail = buf.trim();
+        let tailHandled = false;
+        if (!tail.startsWith("data:") && !sseHeadSent) {
+          try {
+            const bare = JSON.parse(tail);
+            if (isQuotaError(bare)) { sendQuotaError(bare); buf = ""; return; }
+          } catch {
+            if (isQuotaError(tail)) { sendQuotaError({ error: { message: tail.slice(0, 500), code: "429", type: "insufficient_quota" } }); buf = ""; return; }
+          }
+        }
+        if (!tailHandled) handleEvent(buf);
+        if (quotaDone) { buf = ""; return; }
+      }
+      if (!doneSeen) { flushPending(); flushTranslated(); clientRes.write("data: [DONE]\n\n"); }
     } catch {}
     buf = "";
-    clientRes.end();
+    try { clientRes.end(); } catch {}
   });
-  upstreamRes.on("error", () => { try { clientRes.end(); } catch {} });
+  upstreamRes.on("error", () => { if (quotaDone) return; try { clientRes.end(); } catch {} });
 }
 
 export function createServer() {
@@ -603,6 +726,13 @@ export function createServer() {
               const data = Buffer.concat(chunks).toString("utf8");
               try {
                 const obj = JSON.parse(data);
+                // Quota error inside HTTP 200 still surfaces as 429 so direct
+                // :1976 vs shim :1977 A/B match status.
+                if (isQuotaError(obj)) {
+                  console.error("[shim] quota exceeded — surfacing 429 (non-stream)");
+                  res.setHeader("x-afm-shim", "1");
+                  return sendJson(res, 429, obj);
+                }
                 translateResponse(obj);
                 if (obj?.choices?.[0]?.message?.tool_calls) {
                   const tcs = obj.choices[0].message.tool_calls;
